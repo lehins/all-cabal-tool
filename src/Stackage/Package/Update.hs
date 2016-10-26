@@ -64,8 +64,10 @@ allCabalUpdate Repositories {..} = do
       [ (allCabalHashes, "deprecated.json")
       , (allCabalMetadata, "deprecated.yaml")
       ]
-  indexFileEntryConduit =$= CL.mapM_ (entryUpdateFile allCabalHashes)
-  {-
+  --indexFileEntryConduit =$= CL.mapM_ (entryUpdateFile allCabalFiles)
+  indexFileEntryConduit =$= CL.iterM (entryUpdateFile allCabalHashes) =$=
+    CL.mapM_ (entryUpdateHashes allCabalHashes)
+{-
   packageVersions <-
     indexFileEntryConduit =$=
     (getZipSink

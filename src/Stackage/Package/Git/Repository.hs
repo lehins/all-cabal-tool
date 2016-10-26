@@ -78,14 +78,16 @@ repoReadFile :: GitRepository -> FilePath -> IO (Maybe LByteString)
 repoReadFile repo@GitRepository {repoInstance = GitInstance {..}} fp = do
   mnewRef <- lookupFileRef gitWorkTree (toTreePath fp)
   {- check work tree first, that file might have been updated. -}
-  mref <-
+  (isNew, mref) <-
     case mnewRef of
-      Just newRef' -> return $ Just newRef'
+      Just newRef -> return (True, Just newRef)
       Nothing -> do
+        mRef <-
           resolvePath
             gitRepo
             gitBranchRef
             (map (entName . S8.pack) $ splitDirectories fp)
+        return (False, mRef)
   case mref of
     Just ref -> do
       mobj <- getObject gitRepo ref True
@@ -93,7 +95,7 @@ repoReadFile repo@GitRepository {repoInstance = GitInstance {..}} fp = do
         Just (ObjBlob (Blob blob))
         {- if we are reading a file, then we expect it to be present in a work tree too. -}
          -> do
-          insertRef repo (toTreePath fp) ref
+          unless isNew $ insertRef repo (toTreePath fp) ref
           return $ Just blob
         _ -> return Nothing
     Nothing -> return Nothing

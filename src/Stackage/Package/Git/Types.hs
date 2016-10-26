@@ -1,4 +1,5 @@
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE NoImplicitPrelude #-}
@@ -14,6 +15,7 @@ import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Unsafe as BU
 import Data.Git.Ref
 import qualified Data.Map as Map
+import qualified Data.HashTable.IO as H
 import Data.Word (Word32)
 import Data.Hourglass (timeFromElapsed)
 import Foreign.Storable (peekByteOff)
@@ -40,18 +42,23 @@ data GitInfo = GitInfo
   , gitTagName :: Maybe ByteString
     -- ^ Create a tag after an update.
   , gitLocalPath :: FilePath
-  , gitRootTree :: Maybe (WorkTree ShortRef ShortRef)
   }
 
+type WorkTree = H.BasicHashTable FileName TreeEntry
 
+type ObjectsTable = H.BasicHashTable ShortRef ()
+
+data TreeEntry
+  = TEDir !WorkTree
+  | TEFile !G.Ref
 
 data GitInstance = GitInstance
   { gitRepo :: G.Git
     -- ^ Git repository instance.
-  , gitBranchRef :: MVar G.Ref
-    -- ^ Reference of the commit, that current branch is pointing to.
-  , gitWorkTree :: MVar (WorkTree ShortRef ShortRef, WorkTree () GitFile)
+  , gitBranchRef :: G.Ref
     -- ^ Current work tree written to the git store.
+  , gitObjects :: !ObjectsTable
+  , gitWorkTree :: !WorkTree
   }
 
 
@@ -61,25 +68,15 @@ data GitRepository = GitRepository
   }
 
 
-
-
-data GitFile = GitFile
-  { gitFileRef :: !G.Ref
-  , gitFileType :: !FileType
-  , gitFileZipped :: !ByteString
-  } deriving (Show)
-
-type GitTree = G.Tree
-
-type GitCommit = G.Commit
-
-type GitTag = G.Tag
-
-
 data FileName
   = FileName !BS.ShortByteString
   | DirectoryName !BS.ShortByteString
   deriving (Show)
+
+
+bsFileName :: FileName -> ByteString
+bsFileName !(FileName fName) = BS.fromShort fName
+bsFileName !(DirectoryName dirName) = S8.init $ BS.fromShort dirName
 
 
 type TreePath = [FileName]
@@ -95,14 +92,14 @@ toTreePath path = foldr toFileName [] splitPath'
     toFileName fDir tp = DirectoryName (BS.toShort $ S8.snoc fDir '/') : tp
 
 
-
-
 instance Eq FileName where
   (==) (FileName f1) (FileName f2) = f1 == f2
-  (==) (FileName f) (DirectoryName d) = BS.fromShort f == S8.init (BS.fromShort d)
-  (==) (DirectoryName d) (FileName f) = S8.init (BS.fromShort d) == BS.fromShort f
   (==) (DirectoryName d1) (DirectoryName d2) = d1 == d2
+  (==) f1 f2 = bsFileName f1 == bsFileName f2
 
+
+instance Hashable FileName where
+  hashWithSalt s = hashWithSalt s . bsFileName
 
 instance Ord FileName where
   compare (FileName f1) (FileName f2) = compare f1 f2
@@ -119,50 +116,20 @@ data ShortRef =
   ShortRef !Word64
            !Word64
            !Word32
-  deriving (Eq, Ord)
+  deriving (Generic, Eq, Ord)
+instance Hashable ShortRef
 
-toShortRef :: MonadIO m => Ref -> m ShortRef
-toShortRef !(toBinary -> bs)
+bsToShortRef ::MonadIO m => ByteString -> m ShortRef
+bsToShortRef bs
     | length bs /= 20 = error "Stackage.Package.Git.Types.toShortRef: length is not 20"
     | otherwise = liftIO $ BU.unsafeUseAsCString bs $ \ptr -> ShortRef
         <$> peekByteOff ptr 0
         <*> peekByteOff ptr 8
         <*> peekByteOff ptr 16
 
+toShortRef :: MonadIO m => Ref -> m ShortRef
+toShortRef = bsToShortRef . toBinary
 
-fromShortRef :: ShortRef -> Ref
-fromShortRef !(ShortRef w64 w64' w32) =
-  fromBinary $
-  L.toStrict $
-  B.toLazyByteString
-    (BE.word64Host w64 <> BE.word64Host w64' <> BE.word32Host w32)
-
-data FileType
-  = ExecFile
-    -- ^ Executable - @0o755@
-  | NonExecFile
-    -- ^ Normal file - @0o644@
-  | NonExecGroupFile
-    -- ^ Grandfathered mode - @0o664@ - @git fsck@ allows this permissions:
-    -- <https://github.com/git/git/blob/8354fa3d4ca50850760ceee9054e3e7a799a4d62/fsck.c#L583>
-  | SymLink
-    -- ^ Symbolic link
-  | GitLink
-    -- ^ Git link, used for modules.
-  deriving (Eq, Show)
-
-
-data WorkTree d f
-  = File !f !FileType
-  | Directory !d !(Map.Map FileName (WorkTree d f))
-  deriving (Show)
-
-
-instance Eq (WorkTree ShortRef ShortRef) where
-  (File ref1 t1) == (File ref2 t2) = ref1 == ref2 && t1 == t2
-  (Directory ref1 _) == (Directory ref2 _) = ref1 == ref2
-  _ == _ = False
-  
 
 
 getPerson :: GitUser -> IO G.Person
@@ -174,17 +141,3 @@ getPerson GitUser {..} = do
     , G.personEmail = userEmail
     , G.personTime = timeFromElapsed now
     }
-
-
-getTreeRef :: WorkTree ShortRef ShortRef -> ShortRef
-getTreeRef (Directory ref _) = ref
-getTreeRef (File ref _) = ref
-
-
-getTreeMode :: WorkTree d f -> G.ModePerm
-getTreeMode Directory {}     = G.ModePerm 0o040000
-getTreeMode (File _ GitLink) = G.ModePerm 0o160000
-getTreeMode (File _ SymLink) = G.ModePerm 0o120000
-getTreeMode (File _ ExecFile) = G.ModePerm 0o100755
-getTreeMode (File _ NonExecFile) = G.ModePerm 0o100644
-getTreeMode (File _ NonExecGroupFile) = G.ModePerm 0o100664

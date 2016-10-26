@@ -9,24 +9,26 @@ import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Lazy as L
 import qualified Data.ByteString.Lazy.Char8 as L8
 import Data.Git hiding (Commit, Tag)
-import qualified Data.Git.Types as G
+import Data.Git.Types
 import Data.Git.Repository
-import qualified Data.Git.Storage.Object as G
+import Data.Git.Storage.Object
 import Data.Git.Storage.Loose
 import qualified Filesystem.Path.CurrentOS as P
 import Data.Conduit.Process
        (withCheckedProcessCleanup, sourceProcessWithStreams,
         Inherited(Inherited))
+import qualified Data.HashTable.IO as H
 import ClassyPrelude.Conduit (sourceLazy, sinkLazyBuilder)
 import System.Directory
 import System.Exit
+import System.FilePath
 import System.Process (proc, cwd, showCommandForUser)
 
 import Stackage.Package.Git.Types
 import Stackage.Package.Git.Object
 import Stackage.Package.Git.WorkTree
 
-withRepository :: GitInfo -> (GitRepository -> IO a) -> IO (GitInfo, a)
+withRepository :: GitInfo -> (GitRepository -> IO a) -> IO a
 withRepository info@GitInfo {..} action = do
   properRepo <- isRepo (P.decodeString gitLocalPath)
   unless properRepo $ error $ "There is no git repository in :" ++ gitLocalPath
@@ -39,72 +41,63 @@ withRepository info@GitInfo {..} action = do
           id <$>
         resolveRevision git (fromString gitBranchName)
       headSet git (Right (RefName gitBranchName))
-      branchRefMVar <- newMVar branchRef
-      workTreeMVar <- newEmptyMVar
-      case gitRootTree of
-        Just rootTree -> putMVar workTreeMVar (rootTree, emptyWorkTree)
-        Nothing -> return ()
-      res <-
-        action
-          GitRepository
-          { repoInstance =
-            GitInstance
-            { gitRepo = git
-            , gitBranchRef = branchRefMVar
-            , gitWorkTree = workTreeMVar
-            }
-          , repoInfo = info
+      workTree <- H.new
+      objectsTable <- getObjectsTable gitLocalPath
+      action
+        GitRepository
+        { repoInstance =
+          GitInstance
+          { gitRepo = git
+          , gitBranchRef = branchRef
+          , gitWorkTree = workTree
+          , gitObjects = objectsTable
           }
-      newInfo <-
-        do workTreeEmpty <- isEmptyMVar workTreeMVar
-           if workTreeEmpty
-             then return info
-             else withMVar workTreeMVar $
-                  \(rootTree, _) ->
-                     return $
-                     info
-                     { gitRootTree = Just rootTree
-                     }
-      return (newInfo, res)
+        , repoInfo = info
+        }
 
 
-ensureWorkTree :: GitRepository -> IO ()
-ensureWorkTree GitRepository {repoInstance = GitInstance {..}
-                             ,repoInfo = GitInfo {..}} = do
-  workTreeEmpty <- isEmptyMVar gitWorkTree
-  when workTreeEmpty $
-    withMVar gitBranchRef $
-    \branchRef -> do
-      rootTreeRef <-
-        maybe
-          (error $
-           "Cannot resolve root tree for " ++
-           gitBranchName ++ " for repository: " ++ gitLocalPath)
-          id <$>
-        resolvePath gitRepo branchRef []
-      rootTree <- readWorkTree gitRepo rootTreeRef
-      putMVar gitWorkTree (rootTree, emptyWorkTree)
-  
+getObjectsTable :: FilePath -> IO ObjectsTable
+getObjectsTable localPath = do
+  objectsTable <- H.new
+  let insertSHA =
+        lineAsciiC $
+        takeCE 40 .| decodeBase16C .|
+        (foldC >>= bsToShortRef >>= (\k -> liftIO $ H.insert objectsTable k ()))
+  void $
+    runPipeWithConduit
+      localPath
+      "git"
+      ["rev-list", "--objects", "--all"]
+      (sourceLazy "")
+      (peekForever insertSHA)
+      sinkNull
+  return objectsTable
 
 
 repoReadFile :: GitRepository -> FilePath -> IO (Maybe LByteString)
 repoReadFile repo@GitRepository {repoInstance = GitInstance {..}} fp = do
-  ensureWorkTree repo
-  withMVar gitWorkTree $ \ (rootTree, workTree) -> do
-    let treePath = toTreePath fp
-    case lookupFile workTree treePath of
-      Just f -> do
-        let (G.ObjBlob (G.Blob blob)) =
-              looseUnmarshallZipped $ Zipped $ L.fromStrict $ gitFileZipped f
-        return $ Just blob
+  mnewRef <- lookupFileRef gitWorkTree (toTreePath fp)
+  {- check work tree first, that file might have been updated. -}
+  mref <-
+    case mnewRef of
+      Just newRef' -> return $ Just newRef'
       Nothing -> do
-        case lookupFile rootTree treePath of
-          Just sRef -> do
-            mobj <- getObject gitRepo (fromShortRef sRef) True
-            case mobj of
-              Just (G.ObjBlob (G.Blob blob)) -> return $ Just blob
-              _ -> return Nothing
-          Nothing -> return Nothing
+          resolvePath
+            gitRepo
+            gitBranchRef
+            (map (entName . S8.pack) $ splitDirectories fp)
+  case mref of
+    Just ref -> do
+      mobj <- getObject gitRepo ref True
+      case mobj of
+        Just (ObjBlob (Blob blob))
+        {- if we are reading a file, then we expect it to be present in a work tree too. -}
+         -> do
+          insertRef repo (toTreePath fp) ref
+          return $ Just blob
+        _ -> return Nothing
+    Nothing -> return Nothing
+
 
 
 -- | Same as `readRepoFile`, but will raise an error if file cannot be found.
@@ -121,47 +114,32 @@ repoReadFile' repo@GitRepository {repoInfo = GitInfo {..}} fp = do
 
 
 repoWriteFile :: GitRepository -> FilePath -> LByteString -> IO ()
-repoWriteFile repo fp f =
-  makeGitFile f (fromIntegral $ length f) >>= repoWriteGitFile repo fp
+repoWriteFile repo fp f = do
+  ref <- persistBlob repo f
+  insertRef repo (toTreePath fp) ref
 
-
-
-repoWriteGitFile :: GitRepository -> FilePath -> GitFile -> IO ()
-repoWriteGitFile repo@GitRepository {repoInstance = GitInstance {..}} fp f = do
-  ensureWorkTree repo
-  let treePath = toTreePath fp
-  modifyMVar_ gitWorkTree $
-    \(rootTree, workTree) -> do
-      newWorkTree <-
-        case lookupFile rootTree treePath of
-          Just sRef -> do
-            sRef' <- toShortRef $ gitFileRef f
-            return $
-              if sRef == sRef'
-                then removeGitFile workTree treePath
-                else insertGitFile workTree treePath f
-          Nothing -> return $ insertGitFile workTree treePath f
-      return (rootTree, newWorkTree)
 
 
 repoCreateCommit :: GitRepository -> ByteString -> IO (Maybe Ref)
 repoCreateCommit repo@GitRepository {repoInstance = GitInstance {..}
                                     ,repoInfo = GitInfo {..}} msg = do
-  ensureWorkTree repo
-  mtreeRef <- flushWorkTree repo
+  rootTreeRef <- flushTree repo
+  mtreeRef <- resolvePath gitRepo gitBranchRef []
   case mtreeRef of
-    Nothing -> do
-      putStrLn "Nothing to commit"
-      return Nothing
-    Just treeRef -> do
-      modifyMVar gitBranchRef $ \branchRef -> do
-        commit <- makeGitCommit treeRef [branchRef] gitUser msg
-        newCommit <- case userGpgKey gitUser of
+    Nothing -> error "Could not resolve root tree from current branch"
+    Just treeRef
+      | treeRef == rootTreeRef -> do
+        putStrLn "Nothing to commit"
+        return Nothing
+    Just _ -> do
+      commit <- makeGitCommit rootTreeRef [gitBranchRef] gitUser msg
+      newCommit <-
+        case userGpgKey gitUser of
           Just key -> signCommit gitRepo key commit
           Nothing -> return commit
-        commitRef <- repoWriteObject repo (Commit newCommit)
-        branchWrite gitRepo (RefName gitBranchName) commitRef
-        return (commitRef, Just commitRef)
+      commitRef <- setObject gitRepo (ObjCommit newCommit)
+      branchWrite gitRepo (RefName gitBranchName) commitRef
+      return (Just commitRef)
 
 
 repoCreateTag :: GitRepository -> Ref -> ByteString -> IO (Maybe Ref)
@@ -173,8 +151,8 @@ repoCreateTag repo@GitRepository {repoInstance = GitInstance {..}
     case userGpgKey gitUser of
       Just key -> signTag gitRepo key tag
       Nothing -> return tag
-  ref <- repoWriteObject repo (Tag newTag)
-  writeFile (gitLocalPath </> "refs" </> "tags" </> S8.unpack (G.tagBlob newTag)) (show ref)
+  ref <- setObject gitRepo (ObjTag newTag)
+  writeFile (gitLocalPath </> "refs" </> "tags" </> S8.unpack (tagBlob newTag)) (show ref)
   return $ Just ref
 repoCreateTag _ _ _ = return Nothing
 
@@ -216,7 +194,6 @@ ensureRepository repoHost repoAccount gitUser repoName repoBranchName repoBasePa
     , gitUser = gitUser
     , gitTagName = Nothing
     , gitLocalPath = repoLocalPath
-    , gitRootTree = Nothing
     }
   where
     repoLocalPath = repoBasePath </> repoName
@@ -225,9 +202,9 @@ ensureRepository repoHost repoAccount gitUser repoName repoBranchName repoBasePa
 
 
 
-signCommit :: Git -> String -> G.Commit -> IO G.Commit
+signCommit :: Git -> String -> Commit -> IO Commit
 signCommit gitRepo key commit = do
-  signature <- signObject gitRepo key (G.ObjCommit commit)
+  signature <- signObject gitRepo key (ObjCommit commit)
   -- Workaround for: https://github.com/vincenthz/hit/issues/35
   -- Otherwise should be:
   -- let signatureKey = "gpgsig"
@@ -240,16 +217,16 @@ signCommit gitRepo key commit = do
     }
 
 
-signTag :: Git -> String -> G.Tag -> IO G.Tag
+signTag :: Git -> String -> Tag -> IO Tag
 signTag gitRepo key tag = do
-  signature <- signObject gitRepo key (G.ObjTag tag)
+  signature <- signObject gitRepo key (ObjTag tag)
   return
     tag
     { tagS = S8.intercalate "\n" [tagS tag, L.toStrict signature]
     }
 
 
-signObject :: Git -> String -> G.Object -> IO L.ByteString
+signObject :: Git -> String -> Object -> IO L.ByteString
 signObject gitRepo key obj = do
   gpgProgram <- maybe "gpg" id <$> configGet gitRepo "gpg" "program"
   let args = ["-bsau", key]

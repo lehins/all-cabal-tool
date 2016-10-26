@@ -87,12 +87,12 @@ data IndexFile f = IndexFile
 
 data Cabal = Cabal
   { cabalVersion :: !Version
-  , cabalGitFile :: !GitFile
+  , cabalGitFile :: !LByteString
   }
 
 data Versions = Versions
   { versionsPreferred :: !VersionRange
-  , versionsGitFile :: !GitFile
+  , versionsGitFile :: !LByteString
   }
 
 data HackagePackage = HackagePackage
@@ -139,20 +139,7 @@ getCabalFilePath :: PackageName -> Version -> FilePath
 getCabalFilePath (renderDistText -> pkgName) (renderDistText -> pkgVersion) =
   pkgName </> pkgVersion </> pkgName <.> "cabal"
 
-{-
-getCabalFile pkgName pkgVersion lbs = do
-  gitFile < makeGitFile lbs
-  makeIndexFile
-    pkgName
-    (Just pkgVersion)
-    (renderDistText pkgName <.> "cabal")
-    (getCabalFilePath pkgName pkgVersion)
-    lbs
-    (parsePackageDescription $ unpack $ dropBOM $ decodeUtf8With lenientDecode lbs)
--- https://github.com/haskell/hackage-server/issues/351
-  where
-    dropBOM t = fromMaybe t $ TL.stripPrefix (pack "\xFEFF") t
--}
+
 indexFileEntryConduit
   :: (MonadBase base m, PrimMonad base, MonadThrow m)
   => Conduit Tar.Entry m IndexEntry
@@ -164,7 +151,6 @@ indexFileEntryConduit = CL.mapMaybeM getIndexFileEntry
           case mpkgVersionRange of
             Nothing -> return $ Just $ UnknownEntry $ Tar.entryPath e
             Just pkgVersionRange -> do
-              gitFile <- makeGitFile lbs (fromIntegral sz)
               return $
                 Just $
                 VersionsEntry $
@@ -174,7 +160,7 @@ indexFileEntryConduit = CL.mapMaybeM getIndexFileEntry
                 , ifFile =
                   Versions
                   { versionsPreferred = pkgVersionRange
-                  , versionsGitFile = gitFile
+                  , versionsGitFile = lbs
                   }
                 }
           where (pkgNameStr, range) = break (== ' ') $ L8.unpack lbs
@@ -209,7 +195,6 @@ indexFileEntryConduit = CL.mapMaybeM getIndexFileEntry
                     Right parsedHashes -> parsedHashes
         Just (pkgName, Just pkgVersion, _)
           | getCabalFilePath pkgName pkgVersion == Tar.entryPath e -> do
-            gitFile <- makeGitFile lbs (fromIntegral sz)
             return $
               Just $
               CabalEntry $
@@ -219,7 +204,7 @@ indexFileEntryConduit = CL.mapMaybeM getIndexFileEntry
               , ifFile =
                 Cabal
                 { cabalVersion = pkgVersion
-                , cabalGitFile = gitFile
+                , cabalGitFile = lbs
                 }
               }
         _ -> return $ Just $ UnknownEntry $ Tar.entryPath e

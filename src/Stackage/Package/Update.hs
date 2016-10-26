@@ -47,9 +47,9 @@ entryUpdateFile
   :: MonadIO m
   => GitRepository -> IndexEntry -> m ()
 entryUpdateFile allCabalRepo (CabalEntry IndexFile {..}) = do
-  liftIO $ repoWriteGitFile allCabalRepo ifPath (cabalGitFile ifFile)
+  liftIO $ repoWriteFile allCabalRepo ifPath (cabalGitFile ifFile)
 entryUpdateFile allCabalRepo (VersionsEntry IndexFile {..}) = do
-  liftIO $ repoWriteGitFile allCabalRepo ifPath (versionsGitFile ifFile)
+  liftIO $ repoWriteFile allCabalRepo ifPath (versionsGitFile ifFile)
 entryUpdateFile _ _ = return ()
 
 
@@ -64,6 +64,8 @@ allCabalUpdate Repositories {..} = do
       [ (allCabalHashes, "deprecated.json")
       , (allCabalMetadata, "deprecated.yaml")
       ]
+  indexFileEntryConduit =$= CL.mapM_ (entryUpdateFile allCabalHashes)
+  {-
   packageVersions <-
     indexFileEntryConduit =$=
     (getZipSink
@@ -73,3 +75,4 @@ allCabalUpdate Repositories {..} = do
         ZipSink (CL.mapM_ (entryUpdateHashes allCabalHashes)) *>
         ZipSink sinkPackageVersions))
   updateMetadata allCabalMetadata allCabalFiles packageVersions
+  -}

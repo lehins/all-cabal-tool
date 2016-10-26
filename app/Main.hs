@@ -47,15 +47,15 @@ pushRepos Repositories {..} message = do
         Nothing -> return ()
         Just commitRef -> do
           print commitRef
-          run
-            gitLocalPath
-            "git"
-            ["push", gitAddress, concat [gitBranchName, ":", gitBranchName]]
+          --run
+          --  gitLocalPath
+          --  "git"
+          --  ["push", gitAddress, concat [gitBranchName, ":", gitBranchName]]
           mtagRef <- repoCreateTag repo commitRef message
           print mtagRef
           case mtagRef of
             -- Tag newly created commit with the same message.
-            Just _ -> run gitLocalPath "git" ["push", gitAddress, "--tags", "--force"]
+            Just _ -> return () --run gitLocalPath "git" ["push", gitAddress, "--tags", "--force"]
             Nothing -> return ()
           return ()
 
@@ -206,12 +206,12 @@ main = do
     putStrLn
       "WARNING: No s3-bucket is provided. Uploading of 00-index.tar.gz will be disabled."
   indexReq <- parseRequest $ mirrorFPComplete ++ "/01-index.tar.gz"
-  reposInfoInit <- getReposInfo localPath gitAccount gitUser
-  let innerLoop reposInfo mlastEtag = do
+  reposInfo <- getReposInfo localPath gitAccount gitUser
+  let innerLoop mlastEtag = do
         putStrLn $ "Checking index, etag == " ++ tshow mlastEtag
         commitMessage <- getCommitMessage
-        (newInfo, mnewEtag) <- withRepositories reposInfo $ \ repos -> do
-          (updated, mnewEtag) <- (processIndexUpdate repos indexReq mlastEtag)
+        mnewEtag <- withRepositories reposInfo $ \ repos -> do
+          (updated, mnewEtag) <- processIndexUpdate repos indexReq mlastEtag
           when updated $
             do pushRepos repos commitMessage
                case ms3Bucket of
@@ -219,12 +219,12 @@ main = do
                    updateIndex00 oAwsCredentials s3Bucket (allCabalFiles repos)
                  _ -> return ()
           return mnewEtag
-        threadDelay delay
-        innerLoop newInfo mnewEtag
-        --return ()
+        --threadDelay delay
+        --innerLoop mnewEtag
+        return ()
   let outerLoop = do
         catchAnyDeep
-          (innerLoop reposInfoInit Nothing)
+          (innerLoop Nothing)
           (\e -> do
              hPutStrLn stderr $
                "ERROR: Received an unexpected exception while updating repositories: " ++
